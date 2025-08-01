@@ -201,6 +201,51 @@ class GPT(nn.Module):
             groups, lr=lr, betas=betas,
             fused=fused_ok and device_type=="cuda"
         )
+        # ---------- utility: peak-MFU estimator --------------------------------
+    def estimate_mfu(self, fwdbwd_per_iter: int, dt: float):
+        """
+        Roughly estimate model-FLOPs-utilization (MFU) w.r.t. the
+        A100 BF16 peak of 312 TFLOPs.
+        See PaLM Appendix B for the formula.
+        """
+        N   = self.get_num_params()                          # total params
+        cfg = self.config
+        L,H = cfg.n_layer, cfg.n_head
+        Q   = cfg.n_embd // cfg.n_head
+        T   = cfg.block_size
+
+        flops_per_token  = 6 * N + 12 * L * H * Q * T
+        flops_fwdbwd_tok = flops_per_token * T               # FWD+BWD
+        flops_iter       = flops_fwdbwd_tok * fwdbwd_per_iter
+        flops_per_sec    = flops_iter / dt
+        return flops_per_sec / 312e12                        # ratio to peak
+
+    # ---------- convenience text-generation loop ---------------------------
+    @torch.no_grad()
+    def generate(self,
+                 idx:       torch.LongTensor,
+                 max_new_tokens: int,
+                 temperature:    float = 1.0,
+                 top_k:          int | None = None):
+        """
+        Greedy / top-k sampling loop identical to nano-GPT.
+        `idx` is (B, T) input of token IDs; returns (B, T+max_new_tokens).
+        """
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+
+            logits, _ = self(idx_cond)                       # (B,1,V)
+            logits = logits[:, -1, :] / temperature          # last step
+
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
 
 # ---------------------------------------------------------------------------
 # 6  SELF-TEST & torch.compile
