@@ -15,6 +15,25 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_moe: bool = True           # switch FFN→MoE
+    num_experts: int = 16          # E
+    top_k: int = 2                 # tokens pick k experts (DeepSeek uses k=2)
+    capacity_factor: float = 1.25  # 25 % head-room
+    expert_hidden_mult: int = 4    # d_ff = mult · d_model (
+
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -167,21 +186,6 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.ffn(self.ln_2(x))
         return x
-
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    use_moe: bool = True           # switch FFN→MoE
-    num_experts: int = 16          # E
-    top_k: int = 2                 # tokens pick k experts (DeepSeek uses k=2)
-    capacity_factor: float = 1.25  # 25 % head-room
-    expert_hidden_mult: int = 4    # d_ff = mult · d_model (
 
 class GPT(nn.Module):
 
