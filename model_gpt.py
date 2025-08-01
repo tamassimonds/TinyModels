@@ -91,68 +91,6 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class MoELayer(nn.Module):
-    def __init__(self, cfg: GPTConfig):
-        super().__init__()
-        self.E  = cfg.num_experts
-        self.k  = cfg.top_k
-        self.cap = cfg.capacity_factor
-
-        # experts
-        d_model = cfg.n_embd
-        d_ff    = cfg.expert_hidden_mult * d_model
-        self.experts = nn.ModuleList([nn.Sequential(
-            nn.Linear(d_model, d_ff, bias=cfg.bias),
-            nn.GELU(),
-            nn.Linear(d_ff, d_model, bias=cfg.bias)
-        ) for _ in range(self.E)])
-
-        # router
-        self.router = nn.Linear(d_model, self.E, bias=False)
-
-    def forward(self, x):                          # x: (B,L,d)
-        B, L, _ = x.shape
-        logits   = self.router(x)                  # (B,L,E)
-        probs    = logits.softmax(-1)
-
-        top_p, top_idx = probs.topk(self.k, dim=-1)          # (B,L,k)
-
-        # -------- sparse dispatch (capacity-aware) ----------
-        # Flatten tokens for easier indexing
-        tokens = x.view(-1, x.size(-1))            # (B·L, d)
-        selectors = top_idx.view(-1, self.k)       # (B·L, k)
-        weights   = top_p.view(-1, self.k)
-
-        # Build per-expert buckets
-        capacity = math.ceil(self.cap * selectors.size(0) * self.k / self.E)
-        expert_inp = [ [] for _ in range(self.E) ]
-        expert_w   = [ [] for _ in range(self.E) ]
-
-        for t_id, (tok_sel, tok_w) in enumerate(zip(selectors, weights)):
-            for e, w in zip(tok_sel.tolist(), tok_w.tolist()):
-                if len(expert_inp[e]) < capacity:
-                    expert_inp[e].append((t_id, w))
-        # Pad empty lists so we can cat safely
-        outputs = tokens.new_zeros(tokens.shape)
-
-        for e_id, expert in enumerate(self.experts):
-            if not expert_inp[e_id]:
-                continue
-            idx, w = zip(*expert_inp[e_id])
-            idx = torch.tensor(idx, device=x.device, dtype=torch.long)
-            w   = torch.tensor(w , device=x.device, dtype=torch.float32)
-            y   = expert(tokens[idx]) * w.unsqueeze(1)
-            outputs[idx] += y
-
-        y = outputs.view(B, L, -1)
-        return x + y        # residual add
-
-
-
-
-        
-
-
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -160,12 +98,11 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.ffn  = MoELayer(config) if config.use_moe else MLP(config)
-
+        self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.ffn(self.ln_2(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -177,11 +114,6 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    use_moe: bool = True           # switch FFN→MoE
-    num_experts: int = 16          # E
-    top_k: int = 2                 # tokens pick k experts (DeepSeek uses k=2)
-    capacity_factor: float = 1.25  # 25 % head-room
-    expert_hidden_mult: int = 4    # d_ff = mult · d_model (
 
 class GPT(nn.Module):
 
@@ -250,7 +182,6 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-           
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
