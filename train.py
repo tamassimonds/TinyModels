@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import matplotlib.pyplot as plt
 
 from model import GPTConfig, GPT
 
@@ -134,6 +135,14 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
+# lists to track training progress for plotting
+train_losses = []
+val_losses = []
+eval_steps = []
+# track losses at every step
+step_losses = []
+step_numbers = []
+
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
@@ -241,6 +250,53 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+def plot_training_progress():
+    if len(step_losses) == 0 and len(train_losses) == 0:
+        print("No training data to plot")
+        return
+    
+    plt.figure(figsize=(15, 5))
+    
+    # Plot 1: Per-step training loss
+    plt.subplot(1, 3, 1)
+    if len(step_losses) > 0:
+        plt.plot(step_numbers, step_losses, color='blue', alpha=0.7, linewidth=0.8)
+        plt.xlabel('Training Steps')
+        plt.ylabel('Loss')
+        plt.title('Training Loss (Every Step)')
+        plt.grid(True, alpha=0.3)
+    
+    # Plot 2: Evaluation losses (train and val)
+    plt.subplot(1, 3, 2)
+    if len(train_losses) > 0:
+        plt.plot(eval_steps, train_losses, label='Train Loss', color='blue', marker='o', markersize=4)
+        plt.plot(eval_steps, val_losses, label='Validation Loss', color='red', marker='s', markersize=4)
+        plt.xlabel('Training Steps')
+        plt.ylabel('Loss')
+        plt.title('Train vs Validation Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+    
+    # Plot 3: Combined view with log scale
+    plt.subplot(1, 3, 3)
+    if len(step_losses) > 0:
+        plt.plot(step_numbers, step_losses, color='lightblue', alpha=0.5, linewidth=0.8, label='Train Loss (Every Step)')
+    if len(train_losses) > 0:
+        plt.plot(eval_steps, train_losses, label='Train Loss (Eval)', color='blue', marker='o', markersize=3)
+        plt.plot(eval_steps, val_losses, label='Validation Loss', color='red', marker='s', markersize=3)
+    plt.xlabel('Training Steps')
+    plt.ylabel('Loss')
+    plt.title('Combined View (Log Scale)')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(out_dir, 'training_progress.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"Training progress plot saved to {plot_path}")
+    plt.close()
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -263,6 +319,12 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        
+        # store losses for plotting
+        train_losses.append(losses['train'].item())
+        val_losses.append(losses['val'].item())
+        eval_steps.append(iter_num)
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -321,6 +383,11 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        
+        # store loss at every step for plotting
+        step_losses.append(lossf)
+        step_numbers.append(iter_num)
+        
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
@@ -331,6 +398,10 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+# generate training progress plot at end of training
+if master_process:
+    plot_training_progress()
 
 if ddp:
     destroy_process_group()
