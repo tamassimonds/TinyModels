@@ -26,6 +26,8 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
+class RopePostional_Embedding(nn.Module):
     
 
 
@@ -78,9 +80,6 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-
-
-
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -96,28 +95,6 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
-    
-
-class MoELayer(nn.Module):
-
-    def __init__(self, configs) :
-        super().__init__()
-
-        self.router = nn.Linear(config.n_embd, configs.num_experts)
-        self.experts = [MLP(configs) for expert in experts]
-        self.num_experts = configs.num_experts
-    
-    def forward(self, x):
-        expert_routing =  self.router(x)
-        routing_weights, top_k_experts_index = torch.topk(expert_routing, self.num_experts).indices
-        routing_weights = F.softmax(routing_weights, dim=-1)
-        
-
-        # for index in top_k_experts_index: #so we can do it one by one like this or all at once
-        
-
-
-
 
 class Block(nn.Module):
 
@@ -126,11 +103,11 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.moe = MoELayer(config)
+        self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.moe(self.ln_2(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -140,11 +117,8 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    num_experts:int = 16
-    active_experts:int = 8
 
 class GPT(nn.Module):
 

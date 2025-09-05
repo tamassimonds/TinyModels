@@ -36,7 +36,6 @@ import torch.nn.functional as F
 # =========================
 # 1) MLA-style attention
 # =========================
-
 class MLACausalSelfAttention(nn.Module):
     """
     Multi-Head Latent Attention (MLA) toy implementation.
@@ -123,127 +122,6 @@ class MLACausalSelfAttention(nn.Module):
         y = Y_heads.transpose(1, 2).contiguous().view(B, T, C)  # (B,T,C)
         y = self.resid_dropout(self.o_proj(y))
         return y
-
-
-
-
-
-class BLABlockLatentSelfAttention(nn.Module):
-    def __init__(self, config, block_size: int = 64, compression_ratio: int = 1000,
-                 exact_prefix_mode: bool = True):  # <— new flag (default ON to debug)
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.n_head  = config.n_head
-        self.n_embd  = config.n_embd
-        self.d_head  = self.n_embd // self.n_head
-        self.dropout = config.dropout
-
-        self.block_size = block_size
-        self.d_lat  = max(4, self.n_embd // compression_ratio)
-
-        self.q_proj = nn.Linear(self.n_embd, self.n_embd, bias=config.bias)
-        self.kv_down_block = nn.Linear(self.block_size * self.n_embd, self.d_lat, bias=False)
-
-        self.Wk_up = nn.Parameter(torch.empty(self.n_head, self.d_lat, self.d_head))
-        self.Wv_up = nn.Parameter(torch.empty(self.n_head, self.d_lat, self.d_head))
-        nn.init.xavier_uniform_(self.Wk_up)
-        nn.init.xavier_uniform_(self.Wv_up)
-
-        self.o_proj = nn.Linear(self.n_embd, self.n_embd, bias=config.bias)
-        self.attn_dropout  = nn.Dropout(self.dropout)
-        self.resid_dropout = nn.Dropout(self.dropout)
-
-        self.exact_prefix_mode = exact_prefix_mode
-
-    def _pad_to_block(self, x):
-        B, T, C = x.shape
-        S = self.block_size
-        rem = T % S
-        if rem == 0:
-            return x, T, T // S
-        pad_len = S - rem
-        pad = x.new_zeros(B, pad_len, C)
-        x_pad = torch.cat([x, pad], dim=1)
-        return x_pad, T + pad_len, (T + pad_len) // S
-
-    def _block_mask(self, T, n_blocks, device):
-        # allow blocks <= current token’s block (current-block is prefix-safe)
-        S = self.block_size
-        tok_block = torch.arange(T, device=device) // S        # (T,)
-        blk_idx   = torch.arange(n_blocks, device=device)[None,:]
-        allowed   = (blk_idx <= tok_block[:,None])             # (T,Bn)
-        return allowed[None, None, :, :]                       # (1,1,T,Bn)
-
-    def forward(self, x):
-        B, T, C = x.shape
-        H, Dh, L, S = self.n_head, self.d_head, self.d_lat, self.block_size
-
-        # queries
-        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2)            # (B,H,T,Dh)
-        q_lat = torch.einsum('bhtd,hdl->bhtl', q, self.Wk_up.transpose(1,2))  # (B,H,T,L)
-
-        # pad & blockify
-        x_pad, T_pad, Bn = self._pad_to_block(x)
-        Xb = x_pad.view(B, Bn, S, C)                                    # (B,Bn,S,C)
-
-        # block latents (full) and prefix latents
-        z_block = self.kv_down_block(Xb.reshape(B, Bn, S*C))            # (B,Bn,L)
-        W = self.kv_down_block.weight.view(L, S, C)                     # (L,S,C)
-        contrib  = torch.einsum('bBsc,lsc->bBsl', Xb, W)                # (B,Bn,S,L)
-        z_prefix = torch.cumsum(contrib, dim=2)                         # (B,Bn,S,L)
-
-        # map tokens -> (block, in-block)
-        device   = x.device
-        tok_block = torch.arange(T, device=device) // S                 # (T,)
-        in_block  = torch.arange(T, device=device) %  S                 # (T,)
-        z_cur     = z_prefix[:, tok_block, in_block, :]                 # (B,T,L)
-
-        if self.exact_prefix_mode:
-            # --- STRICT, EASY-TO-REASON MODE (no leaks) ---
-            # Build per-token block-latent tensor and swap current-block column
-            Z_safe = z_block.unsqueeze(1).expand(B, T, Bn, L).clone()   # (B,T,Bn,L)
-            b_idx  = tok_block.view(1, T, 1, 1).expand(B, T, 1, L)      # (B,T,1,L)
-            Z_safe.scatter_(2, b_idx, z_cur.unsqueeze(2))               # replace current block with prefix
-
-            # logits (use Z_safe for K)
-            logits = torch.einsum('bhtl,btBl->bhtB', q_lat, Z_safe)     # (B,H,T,Bn)
-            logits = logits / math.sqrt(Dh)
-            logits = logits.masked_fill(~self._block_mask(T, Bn, device), torch.finfo(logits.dtype).min)
-
-            # attn + V aggregation (also Z_safe for V)
-            P = self.attn_dropout(F.softmax(logits, dim=-1))
-            S_block = torch.einsum('bhtB,btBl->bhtl', P, Z_safe)        # (B,H,T,L)
-
-        else:
-            # --- EFFICIENT MODE (your previous approach + fixes) ---
-            logits = torch.einsum('bhtl,bBl->bhtB', q_lat, z_block)     # (B,H,T,Bn)
-            logits = logits / math.sqrt(Dh)
-
-            # correct current-block logits to use prefix latent
-            z_base_cur = z_block[:, tok_block, :]                       # (B,T,L)
-            delta = z_cur - z_base_cur                                  # (B,T,L)
-            idx = tok_block.view(1,1,T,1).expand(B,H,T,1)               # (B,H,T,1)
-            corr = torch.einsum('bhtl,btl->bht', q_lat, delta)          # (B,H,T)
-            logits = logits.scatter_add(-1, idx, corr.unsqueeze(-1))
-
-            logits = logits.masked_fill(~self._block_mask(T, Bn, device), torch.finfo(logits.dtype).min)
-            P = self.attn_dropout(F.softmax(logits, dim=-1))
-
-            # base aggregation with full-block latents
-            S_block = torch.einsum('bhtB,bBl->bhtl', P, z_block)
-            # correct V for current block as well
-            P_cur = P.gather(-1, idx)                                   # (B,H,T,1)
-            S_block = S_block + P_cur * delta.unsqueeze(1)              # add prefix correction
-
-        # up-projection and output
-        Y_heads = torch.einsum('bhtl,hld->bhtd', S_block, self.Wv_up)
-        y = Y_heads.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.o_proj(y))
-
-
-    
-
-
 
 
 # ====================================
@@ -390,11 +268,10 @@ class Block(nn.Module):
     def __init__(self, config, banded_att=False):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = BLABlockLatentSelfAttention(config)
-        # if banded_att:
-        #     self.attn = BandedCausalSelfAttention(config, band_size=128)
-        # else:
-        #     self.attn = MLACausalSelfAttention(config)
+        if banded_att:
+            self.attn = BandedCausalSelfAttention(config, band_size=128)
+        else:
+            self.attn = MLACausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 

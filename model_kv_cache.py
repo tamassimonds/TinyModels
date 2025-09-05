@@ -15,6 +15,7 @@ import torch
 from torch._inductor.utils import fp8_bench
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers.generation.utils import GenerateEncoderDecoderOutput
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -36,7 +37,6 @@ import torch.nn.functional as F
 # =========================
 # 1) MLA-style attention
 # =========================
-
 class MLACausalSelfAttention(nn.Module):
     """
     Multi-Head Latent Attention (MLA) toy implementation.
@@ -125,127 +125,6 @@ class MLACausalSelfAttention(nn.Module):
         return y
 
 
-
-
-
-class BLABlockLatentSelfAttention(nn.Module):
-    def __init__(self, config, block_size: int = 64, compression_ratio: int = 1000,
-                 exact_prefix_mode: bool = True):  # <— new flag (default ON to debug)
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.n_head  = config.n_head
-        self.n_embd  = config.n_embd
-        self.d_head  = self.n_embd // self.n_head
-        self.dropout = config.dropout
-
-        self.block_size = block_size
-        self.d_lat  = max(4, self.n_embd // compression_ratio)
-
-        self.q_proj = nn.Linear(self.n_embd, self.n_embd, bias=config.bias)
-        self.kv_down_block = nn.Linear(self.block_size * self.n_embd, self.d_lat, bias=False)
-
-        self.Wk_up = nn.Parameter(torch.empty(self.n_head, self.d_lat, self.d_head))
-        self.Wv_up = nn.Parameter(torch.empty(self.n_head, self.d_lat, self.d_head))
-        nn.init.xavier_uniform_(self.Wk_up)
-        nn.init.xavier_uniform_(self.Wv_up)
-
-        self.o_proj = nn.Linear(self.n_embd, self.n_embd, bias=config.bias)
-        self.attn_dropout  = nn.Dropout(self.dropout)
-        self.resid_dropout = nn.Dropout(self.dropout)
-
-        self.exact_prefix_mode = exact_prefix_mode
-
-    def _pad_to_block(self, x):
-        B, T, C = x.shape
-        S = self.block_size
-        rem = T % S
-        if rem == 0:
-            return x, T, T // S
-        pad_len = S - rem
-        pad = x.new_zeros(B, pad_len, C)
-        x_pad = torch.cat([x, pad], dim=1)
-        return x_pad, T + pad_len, (T + pad_len) // S
-
-    def _block_mask(self, T, n_blocks, device):
-        # allow blocks <= current token’s block (current-block is prefix-safe)
-        S = self.block_size
-        tok_block = torch.arange(T, device=device) // S        # (T,)
-        blk_idx   = torch.arange(n_blocks, device=device)[None,:]
-        allowed   = (blk_idx <= tok_block[:,None])             # (T,Bn)
-        return allowed[None, None, :, :]                       # (1,1,T,Bn)
-
-    def forward(self, x):
-        B, T, C = x.shape
-        H, Dh, L, S = self.n_head, self.d_head, self.d_lat, self.block_size
-
-        # queries
-        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2)            # (B,H,T,Dh)
-        q_lat = torch.einsum('bhtd,hdl->bhtl', q, self.Wk_up.transpose(1,2))  # (B,H,T,L)
-
-        # pad & blockify
-        x_pad, T_pad, Bn = self._pad_to_block(x)
-        Xb = x_pad.view(B, Bn, S, C)                                    # (B,Bn,S,C)
-
-        # block latents (full) and prefix latents
-        z_block = self.kv_down_block(Xb.reshape(B, Bn, S*C))            # (B,Bn,L)
-        W = self.kv_down_block.weight.view(L, S, C)                     # (L,S,C)
-        contrib  = torch.einsum('bBsc,lsc->bBsl', Xb, W)                # (B,Bn,S,L)
-        z_prefix = torch.cumsum(contrib, dim=2)                         # (B,Bn,S,L)
-
-        # map tokens -> (block, in-block)
-        device   = x.device
-        tok_block = torch.arange(T, device=device) // S                 # (T,)
-        in_block  = torch.arange(T, device=device) %  S                 # (T,)
-        z_cur     = z_prefix[:, tok_block, in_block, :]                 # (B,T,L)
-
-        if self.exact_prefix_mode:
-            # --- STRICT, EASY-TO-REASON MODE (no leaks) ---
-            # Build per-token block-latent tensor and swap current-block column
-            Z_safe = z_block.unsqueeze(1).expand(B, T, Bn, L).clone()   # (B,T,Bn,L)
-            b_idx  = tok_block.view(1, T, 1, 1).expand(B, T, 1, L)      # (B,T,1,L)
-            Z_safe.scatter_(2, b_idx, z_cur.unsqueeze(2))               # replace current block with prefix
-
-            # logits (use Z_safe for K)
-            logits = torch.einsum('bhtl,btBl->bhtB', q_lat, Z_safe)     # (B,H,T,Bn)
-            logits = logits / math.sqrt(Dh)
-            logits = logits.masked_fill(~self._block_mask(T, Bn, device), torch.finfo(logits.dtype).min)
-
-            # attn + V aggregation (also Z_safe for V)
-            P = self.attn_dropout(F.softmax(logits, dim=-1))
-            S_block = torch.einsum('bhtB,btBl->bhtl', P, Z_safe)        # (B,H,T,L)
-
-        else:
-            # --- EFFICIENT MODE (your previous approach + fixes) ---
-            logits = torch.einsum('bhtl,bBl->bhtB', q_lat, z_block)     # (B,H,T,Bn)
-            logits = logits / math.sqrt(Dh)
-
-            # correct current-block logits to use prefix latent
-            z_base_cur = z_block[:, tok_block, :]                       # (B,T,L)
-            delta = z_cur - z_base_cur                                  # (B,T,L)
-            idx = tok_block.view(1,1,T,1).expand(B,H,T,1)               # (B,H,T,1)
-            corr = torch.einsum('bhtl,btl->bht', q_lat, delta)          # (B,H,T)
-            logits = logits.scatter_add(-1, idx, corr.unsqueeze(-1))
-
-            logits = logits.masked_fill(~self._block_mask(T, Bn, device), torch.finfo(logits.dtype).min)
-            P = self.attn_dropout(F.softmax(logits, dim=-1))
-
-            # base aggregation with full-block latents
-            S_block = torch.einsum('bhtB,bBl->bhtl', P, z_block)
-            # correct V for current block as well
-            P_cur = P.gather(-1, idx)                                   # (B,H,T,1)
-            S_block = S_block + P_cur * delta.unsqueeze(1)              # add prefix correction
-
-        # up-projection and output
-        Y_heads = torch.einsum('bhtl,hld->bhtd', S_block, self.Wv_up)
-        y = Y_heads.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.o_proj(y))
-
-
-    
-
-
-
-
 # ====================================
 # 2) Banded (local) causal attention
 # ====================================
@@ -317,7 +196,7 @@ class BandedCausalSelfAttention(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, layer_number):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
         self.n_head = cfg.n_head
@@ -325,30 +204,42 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.do_attn = nn.Dropout(cfg.dropout)
         self.do_res  = nn.Dropout(cfg.dropout)
-        self.flash   = hasattr(F, "scaled_dot_product_attention")
-        if not self.flash:
-            self.register_buffer(
-                "mask",
-                torch.tril(torch.ones(cfg.block_size, cfg.block_size))
-                      .view(1,1,cfg.block_size,cfg.block_size)
-            )
+        self.mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size)).unsqueeze(0).unsqueeze(0)
+        
+        self.layer_number = layer_number
+
+      
     def forward(self, x):
         B,T,C = x.size()
-        q,k,v = self.c_attn(x).split(C, dim=2)
+        token_q,token_k,token_v = self.c_attn(x).split(C, dim=2)
+        q = token_q
+
+        if kv_cache:
+            
+            k_cache = kv_cache.keys_layers.get(self.layer_number, None)
+            if k_cache is not None:
+                k = torch.concat([k_cache, token_k], dim=1)
+            else: 
+                k = token_k
+            
+            v_cache = kv_cache.values_layers.get(self.layer_number, None)
+            if v_cache is not None:
+                v = torch.concat([v_cache, token_v], dim=1)
+            else:
+                v = token_v
+
+            kv_cache.add_key(token_k, self.layer_number)
+            kv_cache.add_value(token_v, self.layer_number)
+        
+        T_all = k.size()[1]
         q = q.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
-        k = k.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
-        v = v.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
-        if self.flash:
-            y = F.scaled_dot_product_attention(
-                q,k,v,
-                dropout_p=self.do_attn.p if self.training else 0.0,
-                is_causal=True
-            )
-        else:
-            a = (q @ k.transpose(-2,-1)) / math.sqrt(k.size(-1))
-            a = a.masked_fill(self.mask[:,:,:T,:T]==0, float('-inf'))
-            a = self.do_attn(F.softmax(a, dim=-1))
-            y = a @ v
+        k = k.view(B,T_all,self.n_head,C//self.n_head).transpose(1,2)
+        v = v.view(B,T_all,self.n_head,C//self.n_head).transpose(1,2)
+     
+        a = (q @ k.transpose(-2,-1)) / math.sqrt(k.size(-1))
+        a = a.masked_fill(self.mask[:,:,:T,:T_all]==0, float('-inf'))
+        a = self.do_attn(F.softmax(a, dim=-1))
+        y = a @ v
         y = y.transpose(1,2).contiguous().view(B,T,C)
         return self.do_res(self.c_proj(y))
 
@@ -387,10 +278,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, banded_att=False):
+    def __init__(self, config, layer_number, banded_att=False):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = BLABlockLatentSelfAttention(config)
+        self.attn = CausalSelfAttention(config, layer_number)
         # if banded_att:
         #     self.attn = BandedCausalSelfAttention(config, band_size=128)
         # else:
@@ -405,7 +296,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    block_size: int = 10240
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
@@ -425,7 +316,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, banded_att=i%2) for i in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, banded_att=i, layer_number = i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -601,6 +492,20 @@ class GPT(nn.Module):
         # breakpoint()
         return mfu
 
+
+
+    def prefill(self, idx):
+        for i, _ in enumerate(idx):
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                # forward the model to get the logits for the index in the sequence
+                logits, _ = self(idx_cond)
+                # pluck the logits at the final step and scale by desired temperature
+              
+                # apply softmax to convert logits to (normalized) probabilities
+             
+       
+
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
@@ -608,22 +513,135 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+        if not kv_cache:
+            for _ in range(max_new_tokens):
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                # forward the model to get the logits for the index in the sequence
+                logits, _ = self(idx_cond)
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits[:, -1, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1)
+        else:
+            last_id = idx_next[-1]
+            #have to do something complex here around prefilling vs generation
+
+            for _ in range(max_new_tokens):
+                pass
 
         return idx
+
+
+configs = GPTConfig()
+model = GPT(configs)
+from time import time
+from transformers import GPT2Tokenizer
+
+
+
+
+class KV_cache:
+
+    def __init__(self):
+
+        self.keys_layers = {}
+        self.values_layers = {}
+
+    def add_key(self, k, layer):
+        keys = self.keys_layers.get(layer, None)
+        if keys is not None:
+            self.keys_layers[layer] = torch.cat([keys,k], dim=1)
+        else:
+            self.keys_layers[layer] = k
+        
+
+    def add_value(self, v, layer):
+        values = self.values_layers.get(layer, None)
+        # breakpoint()
+        if values is not None:
+            self.values_layers[layer] = torch.cat([values,v], dim=1)
+        else:
+            self.values_layers[layer] = v
+
+    def size(self, configs):
+        
+        keys = self.keys_layers.get(0, None)
+        if keys is None:
+            return 0
+        
+        
+        #per layer
+        num_elements = keys.numel()  # Total number of elements
+        element_size = keys.element_size()  # Bytes per element
+        memory_bytes = num_elements * element_size
+
+        return memory_bytes * configs.n_layer
+
+        
+
+
+    
+configs = GPTConfig()
+        
+
+def time_it(func):
+    def wrapper(*args, **kwargs):
+        start_time = time()
+        result = func(*args, **kwargs)  # Call with args/kwargs and capture return value
+        end_time = time()
+        print(f"runtime = {end_time - start_time:.4f} seconds")
+        return result  # Return the function's result
+    
+    return wrapper
+
+
+
+# Load the GPT-2 tokenizer
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+# Example usage
+text = "The"
+
+# Encode text to tokens
+
+
+idx = torch.tensor(tokenizer.encode(text)).unsqueeze(0)
+using_kv_cache = True
+kv_cache = KV_cache()
+
+
+@time_it
+def generate(idx):
+    # return model.generate(idx, 1024)
+    pass
+
+
+# output_ids = generate(idx)
+
+input = torch.tensor(idx)
+# breakpoint()
+next_token = input
+for _ in range(10000):
+    next_token = model(input)
+
+
+size = kv_cache.size(configs)
+
+print(f"size : {size/1e3}kB")
+print(f"size : {size/1e6}MB")
+print(f"size : {size/1e9}GB")
+# breakpoint()
+# outputs_str = tokenizer.decode(output_ids[0])
+# print(outputs_str)
+
+
+
